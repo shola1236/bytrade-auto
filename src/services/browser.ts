@@ -1,20 +1,34 @@
 import Steel from 'steel-sdk';
-import puppeteer from 'puppeteer-core';
+import puppeteer, { Browser } from 'puppeteer-core';
 
 export let currentSessionViewerUrl: string | null = null;
+let activeBrowser: Browser | null = null;
 
-export async function initBrowser() {
-  const steel = new Steel({ apiKey: process.env.STEEL_API_KEY });
+export async function initBrowser(): Promise<Browser> {
+  // Steel SDK automatically detects process.env.STEEL_API_KEY
+  const steel = new Steel();
 
-  // Create session
-  const session = await steel.sessions.create({ stealth: true });
+  // Create Steel browser session (Stealth is enabled automatically by Steel)
+  const session = await steel.sessions.create();
 
-  // Save the live interactive URL
-  currentSessionViewerUrl = session.sessionViewerUrl || `https://app.steel.dev/sessions/${session.id}`;
+  currentSessionViewerUrl =
+    session.sessionViewerUrl || `https://app.steel.dev/sessions/${session.id}`;
 
-  const browser = await puppeteer.connect({
+  activeBrowser = await puppeteer.connect({
     browserWSEndpoint: `wss://connect.steel.dev?sessionId=${session.id}&apiKey=${process.env.STEEL_API_KEY}`,
   });
 
-  return browser;
+  return activeBrowser;
+}
+
+export async function getActivePage(browser: Browser) {
+  const pages = await browser.pages();
+  return pages.length > 0 ? pages[0] : await browser.newPage();
+}
+
+export async function closeBrowser(): Promise<void> {
+  if (activeBrowser) {
+    await activeBrowser.close().catch(() => {});
+    activeBrowser = null;
+  }
 }
