@@ -1,6 +1,8 @@
-import { Page, Frame } from "puppeteer";
+import { Page } from "puppeteer";
 import fs from "fs";
 import path from "path";
+import { sendCaptchaPrompt, waitForDoneCommand } from "./telegramBot";
+import { currentSessionViewerUrl } from "./browser";
 
 export type TradeOption = "BIG" | "SMALL" | "ODD" | "EVEN";
 
@@ -8,7 +10,7 @@ const SESSION_FILE = path.resolve(process.cwd(), "session_cookies.json");
 
 export class TradeExecutor {
   /**
-   * Attempts to restore saved cookies from disk.
+   * Attempts to restore saved session cookies from disk.
    */
   private async restoreSession(page: Page): Promise<boolean> {
     if (!fs.existsSync(SESSION_FILE)) return false;
@@ -16,140 +18,104 @@ export class TradeExecutor {
     try {
       const cookieData = fs.readFileSync(SESSION_FILE, "utf-8");
       const cookies = JSON.parse(cookieData);
-      await page.setCookie(...cookies);
-      console.log("[SESSION] Injected saved session cookies.");
-      return true;
+      if (Array.isArray(cookies) && cookies.length > 0) {
+        await page.setCookie(...cookies);
+        console.log(`[SESSION] Successfully injected ${cookies.length} cookies from disk.`);
+        return true;
+      }
     } catch (error) {
       console.warn("[SESSION] Cookie restoration failed:", error);
-      return false;
     }
+    return false;
   }
 
   /**
    * Saves active authenticated session cookies to disk.
    */
-  private async saveSession(page: Page): Promise<void> {
+  public async saveSession(page: Page): Promise<void> {
     try {
       const cookies = await page.cookies();
       fs.writeFileSync(SESSION_FILE, JSON.stringify(cookies, null, 2));
-      console.log("[SESSION] Authenticated session saved to disk.");
+      console.log(`[SESSION] Saved ${cookies.length} session cookies to disk.`);
     } catch (error) {
       console.warn("[SESSION] Failed to save session cookies:", error);
     }
   }
 
   /**
-   * Detects and triggers spacebar focus execution on Cloudflare Turnstile if present.
-   */
-  public async handleTurnstile(page: Page, timeoutMs: number = 10000): Promise<boolean> {
-    const startTime = Date.now();
-
-    while (Date.now() - startTime < timeoutMs) {
-      const frames = page.frames();
-      const turnstileFrame = frames.find((f: Frame) => {
-        const url = f.url().toLowerCase();
-        return url.includes("cloudflare") || url.includes("turnstile") || url.includes("challenges");
-      });
-
-      if (!turnstileFrame) {
-        return true; // No Turnstile widget blocking navigation
-      }
-
-      console.log("[CLOUDFLARE] Turnstile frame detected. Applying focus + spacebar sequence...");
-
-      try {
-        const checkboxSelector = 'input[type="checkbox"], #challenge-stage, .mark, div[role="checkbox"]';
-        await turnstileFrame.waitForSelector(checkboxSelector, { timeout: 2000 }).catch(() => {});
-        const checkbox = await turnstileFrame.$(checkboxSelector);
-
-        if (checkbox) {
-          const box = await checkbox.boundingBox();
-          if (box) {
-            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
-            await page.mouse.down();
-            await page.mouse.up();
-
-            await checkbox.focus();
-            await page.keyboard.press("Space");
-            console.log("[CLOUDFLARE] Dispatched Spacebar press to Turnstile element.");
-            await new Promise((r) => setTimeout(r, 2000));
-          }
-        }
-      } catch {
-        // Retry loop until timeout
-      }
-
-      const isCleared = await page.evaluate(() => {
-        return (
-          !document.title.toLowerCase().includes("just a moment") &&
-          !document.querySelector("iframe[src*='turnstile']")
-        );
-      });
-
-      if (isCleared) {
-        console.log("[CLOUDFLARE] Challenge screen passed.");
-        return true;
-      }
-
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-
-    return false;
-  }
-
-  /**
-   * Performs authentication and direct navigation to the game page.
+   * Handles authentication with cookie session bypass and Telegram live-viewer fallback.
    */
   public async loginAndNavigate(page: Page, email: string, pass: string): Promise<void> {
-    // 1. Check for valid active session
+    // 1. Try Session Bypass using Saved Cookies
     const hasCookies = await this.restoreSession(page);
 
     if (hasCookies) {
-      console.log("[EXECUTOR] Attempting session bypass directly to /#/game...");
+      console.log("[EXECUTOR] Testing saved cookie session on /#/game...");
       await page.goto("https://h5.bytrading.fit/#/game", { waitUntil: "networkidle2" });
-      await this.handleTurnstile(page);
 
       const isGameLoaded = await page
         .waitForSelector(".game-page-options-btn", { visible: true, timeout: 6000 })
         .catch(() => null);
 
       if (isGameLoaded) {
-        console.log("[EXECUTOR] Authenticated session valid. Landed on /#/game.");
+        console.log("[EXECUTOR] Cookie session valid! Landed directly on /#/game.");
         return;
       }
-      console.warn("[SESSION] Saved session invalid or expired. Falling back to login flow...");
+      console.warn("[SESSION] Saved session expired. Proceeding to fresh login flow...");
     }
 
-    // 2. Fresh Login Execution
+    // 2. Navigate to Login Page
     console.log("[EXECUTOR] Navigating to /#/login...");
     await page.goto("https://h5.bytrading.fit/#/login", { waitUntil: "networkidle2" });
-    await this.handleTurnstile(page);
 
     const emailSelector = 'input[placeholder="Please enter your email address."]';
     const passSelector = 'input[type="password"]';
     const loginBtnSelector = ".login-page-btn";
 
-    await page.waitForSelector(emailSelector, { visible: true });
-    await page.waitForSelector(passSelector, { visible: true });
+    try {
+      // Check if login inputs are accessible (i.e. not blocked by Cloudflare Turnstile)
+      await page.waitForSelector(emailSelector, { visible: true, timeout: 8000 });
+    } catch (err) {
+      console.log("[CLOUDFLARE] Turnstile blocking input selector. Sending link to Telegram...");
 
-    // Type credentials with slight typing delay
-    await page.type(emailSelector, email, { delay: 40 });
-    await page.type(passSelector, pass, { delay: 40 });
+      const liveUrl = currentSessionViewerUrl || "https://app.steel.dev";
+      await sendCaptchaPrompt(liveUrl);
 
-    // Click div-based login button
-    await page.waitForSelector(loginBtnSelector, { visible: true });
-    await page.click(loginBtnSelector);
+      // Pause bot execution until user solves captcha in Steel live viewer & sends /done in Telegram
+      console.log("[CLOUDFLARE] Waiting for /done command from Telegram...");
+      await waitForDoneCommand();
+    }
 
-    // Direct routing to game page post-auth
-    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10000 }).catch(() => {});
-    await page.goto("https://h5.bytrading.fit/#/game", { waitUntil: "networkidle2" });
-    await this.handleTurnstile(page);
+    // Check if user already completed the full login manually inside the live session
+    const isAlreadyLoggedIn = await page
+      .waitForSelector(".game-page-options-btn", { visible: true, timeout: 3000 })
+      .catch(() => null);
 
-    await page.waitForSelector(".game-page-options-btn", { visible: true, timeout: 15000 });
+    if (!isAlreadyLoggedIn) {
+      const emailInputExists = await page.$(emailSelector);
 
-    // Save active session for future launches
+      if (emailInputExists) {
+        await page.waitForSelector(emailSelector, { visible: true });
+        await page.waitForSelector(passSelector, { visible: true });
+
+        // Auto-fill credentials
+        await page.type(emailSelector, email, { delay: 40 });
+        await page.type(passSelector, pass, { delay: 40 });
+
+        await page.waitForSelector(loginBtnSelector, { visible: true });
+        await page.click(loginBtnSelector);
+
+        await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10000 }).catch(() => {});
+      }
+
+      // Direct routing to game page post-auth
+      await page.goto("https://h5.bytrading.fit/#/game", { waitUntil: "networkidle2" });
+      await page.waitForSelector(".game-page-options-btn", { visible: true, timeout: 15000 });
+    }
+
+    // 3. Save fresh authenticated cookies after successful login
     await this.saveSession(page);
-    console.log("[EXECUTOR] Login successful. Session stored.");
+    console.log("[EXECUTOR] Login completed & fresh session cookies stored.");
   }
 
   /**
@@ -208,7 +174,7 @@ export class TradeExecutor {
         if (input) input.value = "";
       }, inputSelector);
 
-      // Type active stage stake amount
+      // Type stake amount
       await page.type(inputSelector, amount.toString(), { delay: 30 });
 
       // 4. Trigger Initial Trade Modal
@@ -223,7 +189,7 @@ export class TradeExecutor {
       await page.waitForSelector(modalSelector, { visible: true, timeout: 5000 });
       await page.waitForSelector(confirmBtnSelector, { visible: true, timeout: 5000 });
 
-      // Native dispatch click on confirm div button
+      // Dispatch click on confirm button
       await page.evaluate((btnSel) => {
         const btn = document.querySelector(btnSel) as HTMLElement;
         if (btn) btn.click();
