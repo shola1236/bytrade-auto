@@ -108,18 +108,15 @@ export class SignalListener {
       }
     }
 
-    // 4. Detect asset (defaulting to BTC)
-    let asset: AssetType = "BTC";
-    if (/ETH/i.test(text)) {
-      asset = "ETH";
-    }
+    // 4. Set asset (locked to BTC)
+const asset: AssetType = "BTC";
 
-    return {
-      periodId,
-      asset,
-      option,
-      rawText: text,
-    };
+return {
+  periodId,
+  asset,
+  option,
+  rawText: text,
+};
   }
 
   /**
