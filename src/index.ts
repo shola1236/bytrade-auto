@@ -3,7 +3,7 @@ dotenv.config();
 
 import http from "http";
 import https from "https";
-import { Page } from "puppeteer";
+import { Page, Browser } from "puppeteer";
 import { CloudflareBypassService } from "./services/cloudflareBypass";
 import { StakeManager } from "./services/stakeCalculator";
 import { BotController } from "./services/telegramBot";
@@ -31,6 +31,11 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const PORT = process.env.PORT || 3000;
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL;
 
+// Engine State Trackers
+let browserInstance: Browser | null = null;
+let activePage: Page | null = null;
+let isEngineActive = false;
+
 /**
  * Render Web Service Keep-Alive Server
  * Binds to process.env.PORT and pings itself every 10 minutes to prevent sleep.
@@ -45,11 +50,9 @@ function startKeepAliveServer(): void {
     console.log(`[SERVER] Health check endpoint listening on port ${PORT}`);
   });
 
-  // Determine target ping URL
   const pingUrl = RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
   const client = pingUrl.startsWith("https") ? https : http;
 
-  // Ping every 10 minutes (600,000 ms)
   setInterval(() => {
     client
       .get(pingUrl, (res) => {
@@ -61,13 +64,61 @@ function startKeepAliveServer(): void {
   }, 10 * 60 * 1000);
 }
 
+/**
+ * Launches browser instance and navigates/authenticates session.
+ */
+async function handleStartup(
+  cfService: CloudflareBypassService,
+  tradeExecutor: TradeExecutor
+): Promise<void> {
+  if (isEngineActive) {
+    console.log("[SYSTEM] Startup skipped: Engine is already online.");
+    return;
+  }
+
+  console.log("[BROWSER] Launching stealth browser session...");
+  browserInstance = await cfService.launchStealthBrowser(true);
+  activePage = await browserInstance.newPage();
+
+  console.log("[BROWSER] Logging into platform & routing to trade terminal...");
+  await tradeExecutor.loginAndNavigate(activePage, ACCOUNT_EMAIL, ACCOUNT_PASS);
+
+  isEngineActive = true;
+  console.log("[SYSTEM] Engine startup completed. Online and ready for trades.");
+}
+
+/**
+ * Gracefully terminates active browser instance and cleans resources.
+ */
+async function handleKill(): Promise<void> {
+  if (!isEngineActive && !browserInstance) {
+    console.log("[SYSTEM] Kill skipped: Engine is already offline.");
+    return;
+  }
+
+  console.log("[SYSTEM] Shutting down active browser session...");
+
+  if (activePage) {
+    await activePage.close().catch(() => {});
+    activePage = null;
+  }
+
+  if (browserInstance) {
+    await browserInstance.close().catch(() => {});
+    browserInstance = null;
+  }
+
+  isEngineActive = false;
+  console.log("[SYSTEM] Engine fully terminated. Status: Offline.");
+}
+
 async function bootstrap() {
-  console.log("[SYSTEM] Starting BYTBOT Engine...");
+  console.log("[SYSTEM] Initializing BYTBOT Core Architecture...");
 
   // 1. Initialize Health Check & Render Self-Ping
   startKeepAliveServer();
 
-  // 2. Instantiate Database, Stake Engine & Browser Helpers
+  // 2. Instantiate Database, Stake Engine, Trade & Cloudflare Services
   const stakeManager = new StakeManager(INITIAL_BANKROLL);
   const db = new DatabaseService(SUPABASE_URL, SUPABASE_KEY);
   const tradeExecutor = new TradeExecutor();
@@ -76,22 +127,25 @@ async function bootstrap() {
   // 3. Launch Telegram Control Bot
   const bot = new BotController(BOT_TOKEN, ALLOWED_USER_ID, stakeManager, db);
 
-  // 4. Launch Stealth Puppeteer Browser Session
-  console.log("[BROWSER] Initializing Puppeteer Stealth Instance...");
-  const browser = await cfService.launchStealthBrowser(true); // Headless mode for server hosting
-  const page: Page = await browser.newPage();
+  // 4. Bind Manual Startup and Kill Handlers to Telegram Bot Controller
+  bot.registerEngineControls({
+    onStartup: () => handleStartup(cfService, tradeExecutor),
+    onKill: () => handleKill(),
+  });
 
-  console.log("[BROWSER] Logging into platform & navigating to trade game UI...");
-  await tradeExecutor.loginAndNavigate(page, ACCOUNT_EMAIL, ACCOUNT_PASS);
-
-  // 5. Initialize GramJS Signal Listener
+  // 5. Initialize GramJS Signal Listener (Runs continuously in background)
   const signalListener = new SignalListener(API_ID, API_HASH, SESSION_STRING, CHANNEL_ID);
 
   await signalListener.start(
-    // Handle Incoming Trade Signal Event
+    // Incoming Trade Signal Event Handler
     async (signal: SignalData) => {
+      if (!isEngineActive || !activePage) {
+        console.log("[ACTION] Trade ignored: Engine is currently offline. Send /start -> Startup Session.");
+        return;
+      }
+
       if (bot.isPaused()) {
-        console.log("[ACTION] Trading paused via Telegram menu. Skipping signal execution.");
+        console.log("[ACTION] Trade paused via Telegram menu. Skipping signal execution.");
         return;
       }
 
@@ -106,7 +160,7 @@ async function bootstrap() {
       await db.logTrade(signal.periodId, signal.option, stageNum, activeStake);
 
       // Execute order via browser automation
-      const success = await tradeExecutor.executeOrder(page, signal.option, activeStake);
+      const success = await tradeExecutor.executeOrder(activePage, signal.option, activeStake);
 
       if (success) {
         await bot.notifyTradeSuccess(signal.periodId, signal.option, stageNum, activeStake);
@@ -115,12 +169,12 @@ async function bootstrap() {
       }
     },
 
-    // Handle Incoming Round Outcome Event
+    // Incoming Round Outcome Event Handler
     async (result: ResultData) => {
       // Settle PENDING order in Supabase
       const settledTrade = await db.settleLatestTrade(result.isWin);
 
-      // Advance or reset 8-stage martingale index
+      // Advance or reset martingale stage
       const outcome = stakeManager.registerResult(result.isWin);
 
       console.log(
@@ -139,7 +193,7 @@ async function bootstrap() {
     }
   );
 
-  console.log("[SYSTEM] All engines running. Listening for channel updates...");
+  console.log("[SYSTEM] Telegram controller online. Use Telegram dashboard to trigger startup.");
 }
 
 bootstrap().catch((err) => {
