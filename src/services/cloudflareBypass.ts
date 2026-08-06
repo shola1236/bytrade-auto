@@ -1,103 +1,99 @@
-import { Page, Frame } from "puppeteer";
-import fs from "fs";
+import puppeteer, { Browser, Page, Frame } from "puppeteer";
+import puppeteerExtra from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import path from "path";
 
-const SESSION_FILE = path.resolve(process.cwd(), "session_cookies.json");
+puppeteerExtra.use(StealthPlugin());
 
 export class CloudflareBypassService {
+  private browser: Browser | null = null;
+
   /**
-   * Interacts with Cloudflare Turnstile challenge using focus + Spacebar technique.
+   * Launch local Puppeteer or connect to Steel.dev Cloud Browser
    */
-  public async solveTurnstileIfPresent(page: Page, timeoutMs: number = 15000): Promise<boolean> {
+  public async launchStealthBrowser(headless: boolean = true): Promise<Browser> {
+    const steelApiKey = process.env.STEEL_API_KEY;
+
+    // 1. Steel.dev Cloud Connection (Production / Render environment)
+    if (steelApiKey) {
+      console.log("[BROWSER] STEEL_API_KEY detected. Connecting to Steel.dev Cloud Browser...");
+      
+      this.browser = await puppeteer.connect({
+        browserWSEndpoint: `wss://connect.steel.dev?apiKey=${steelApiKey}`,
+        defaultViewport: { width: 1280, height: 800 },
+      });
+
+      return this.browser;
+    }
+
+    // 2. Local Stealth Puppeteer Fallback (Local Development)
+    console.log("[BROWSER] STEEL_API_KEY not found. Launching local Puppeteer Stealth...");
+    const userDataDir = path.resolve(process.cwd(), ".user_data");
+
+    this.browser = (await puppeteerExtra.launch({
+      headless,
+      userDataDir,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--window-size=1280,800",
+      ],
+      defaultViewport: { width: 1280, height: 800 },
+    })) as unknown as Browser;
+
+    return this.browser;
+  }
+
+  /**
+   * Fallback solver for Turnstile frames if encountered on-page
+   */
+  public async handleTurnstile(page: Page, timeoutMs: number = 10000): Promise<boolean> {
     const startTime = Date.now();
 
     while (Date.now() - startTime < timeoutMs) {
-      // 1. Check if Cloudflare Turnstile iframe exists on page
-      const frames = page.frames();
-      const turnstileFrame = frames.find((f: Frame) => {
+      const turnstileFrame = page.frames().find((f: Frame) => {
         const url = f.url().toLowerCase();
-        return url.includes("cloudflare") || url.includes("turnstile") || url.includes("challenges");
+        return (
+          url.includes("cloudflare") ||
+          url.includes("turnstile") ||
+          url.includes("challenges")
+        );
       });
 
-      if (!turnstileFrame) {
-        // No challenge iframe detected, page is clear
-        return true;
-      }
-
-      console.log("[CLOUDFLARE] Turnstile challenge detected. Attaching spacebar focus technique...");
+      if (!turnstileFrame) return true;
 
       try {
-        // 2. Locate checkbox inside the Turnstile iframe
-        const checkboxSelector = 'input[type="checkbox"], #challenge-stage, .mark, div[role="checkbox"]';
-        
-        await turnstileFrame.waitForSelector(checkboxSelector, { timeout: 3000 }).catch(() => {});
+        const checkboxSelector =
+          'input[type="checkbox"], #challenge-stage, .mark, div[role="checkbox"]';
         const checkbox = await turnstileFrame.$(checkboxSelector);
 
         if (checkbox) {
-          // Bounding box click + spacebar trigger sequence
           const box = await checkbox.boundingBox();
           if (box) {
-            // Move mouse smoothly to center of checkbox
-            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
+            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, {
+              steps: 5,
+            });
             await page.mouse.down();
             await page.mouse.up();
-
-            // Focus and dispatch Spacebar press
             await checkbox.focus();
             await page.keyboard.press("Space");
-            console.log("[CLOUDFLARE] Dispatched Spacebar press to Turnstile widget.");
-
-            // Wait 2 seconds for verification token to resolve
             await new Promise((r) => setTimeout(r, 2000));
           }
         }
-      } catch (err) {
-        // Retry loop until timeout
-      }
+      } catch {}
 
-      // Check if page navigated or challenge dissolved
       const isCleared = await page.evaluate(() => {
-        return !document.title.toLowerCase().includes("just a moment") &&
-               !document.querySelector("iframe[src*='turnstile']");
+        return (
+          !document.title.toLowerCase().includes("just a moment") &&
+          !document.querySelector("iframe[src*='turnstile']")
+        );
       });
 
-      if (isCleared) {
-        console.log("[CLOUDFLARE] Verification cleared!");
-        return true;
-      }
-
+      if (isCleared) return true;
       await new Promise((r) => setTimeout(r, 1000));
     }
 
     return false;
-  }
-
-  /**
-   * Saves authentication cookies to disk after successful login.
-   */
-  public async saveSessionCookies(page: Page): Promise<void> {
-    const cookies = await page.cookies();
-    fs.writeFileSync(SESSION_FILE, JSON.stringify(cookies, null, 2));
-    console.log("[SESSION] Saved authenticated session cookies to disk.");
-  }
-
-  /**
-   * Loads saved cookies into the browser context to skip the /#/login page completely.
-   */
-  public async restoreSessionCookies(page: Page): Promise<boolean> {
-    if (!fs.existsSync(SESSION_FILE)) {
-      return false;
-    }
-
-    try {
-      const cookieData = fs.readFileSync(SESSION_FILE, "utf-8");
-      const cookies = JSON.parse(cookieData);
-      await page.setCookie(...cookies);
-      console.log("[SESSION] Injected saved session cookies.");
-      return true;
-    } catch (error) {
-      console.warn("[SESSION] Failed to restore cookies:", error);
-      return false;
-    }
   }
 }
