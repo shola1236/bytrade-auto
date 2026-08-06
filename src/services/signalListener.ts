@@ -1,4 +1,5 @@
-import { TelegramClient, events } from "telegram";
+import { TelegramClient } from "telegram";
+import { NewMessage, NewMessageEvent } from "telegram/events";
 import { StringSession } from "telegram/sessions";
 import { AssetType, TradeOption } from "../types";
 
@@ -43,7 +44,7 @@ export class SignalListener {
     await this.client.connect();
     console.log("[LISTENER] GramJS userclient connected successfully.");
 
-    this.client.addEventHandler(async (event: events.NewMessageEvent) => {
+    this.client.addEventHandler(async (event: NewMessageEvent) => {
       const message = event.message;
       if (!message || !message.text) return;
 
@@ -68,7 +69,7 @@ export class SignalListener {
         console.log(`[LISTENER] Active Signal Parsed -> Period: ${signalData.periodId} | Action: ${signalData.option}`);
         await onSignal(signalData);
       }
-    }, new events.NewMessage());
+    }, new NewMessage({}));
   }
 
   /**
@@ -109,14 +110,14 @@ export class SignalListener {
     }
 
     // 4. Set asset (locked to BTC)
-const asset: AssetType = "BTC";
+    const asset: AssetType = "BTC";
 
-return {
-  periodId,
-  asset,
-  option,
-  rawText: text,
-};
+    return {
+      periodId,
+      asset,
+      option,
+      rawText: text,
+    };
   }
 
   /**
