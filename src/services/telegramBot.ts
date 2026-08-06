@@ -1,315 +1,231 @@
-import TelegramBot, { InlineKeyboardMarkup } from "node-telegram-bot-api";
-import { StakeManager } from "./stakeCalculator";
-import { DatabaseService } from "./database";
+import TelegramBot, { InlineKeyboardMarkup } from 'node-telegram-bot-api';
 
-export class BotController {
-  private bot: TelegramBot;
-  private allowedUserId: number;
-  private stakeManager: StakeManager;
-  private db: DatabaseService;
-  private isExecutionPaused: boolean = false;
-  private awaitingBankrollInput: boolean = false;
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN!, { polling: true });
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
 
-  constructor(
-    token: string,
-    allowedUserId: number,
-    stakeManager: StakeManager,
-    db: DatabaseService
-  ) {
-    this.allowedUserId = allowedUserId;
-    this.stakeManager = stakeManager;
-    this.db = db;
-    this.bot = new TelegramBot(token, { polling: true });
+let mainMessageId: number | null = null;
+let doneResolver: (() => void) | null = null;
+let waitingForBankrollInput: boolean = false;
 
-    this.registerHandlers();
-  }
+// Engine State Tracking
+let isEngineOnline = false;
+let currentBankroll = 10;
 
-  /** Authorization Middleware Guard */
-  private isOwner(userId?: number): boolean {
-    if (userId !== this.allowedUserId) {
-      console.warn(`[SECURITY] Blocked interaction from unauthorized ID: ${userId}`);
-      return false;
-    }
-    return true;
-  }
+// Callbacks attached from index.ts
+let onStartupCallback: (() => Promise<void>) | null = null;
+let onKillCallback: (() => Promise<void>) | null = null;
+let onBankrollChangeCallback: ((amount: number) => void) | null = null;
 
-  /** Dynamic Main Dashboard Keyboard */
-  private getMainMenuKeyboard(): InlineKeyboardMarkup {
-    const pauseToggleText = this.isExecutionPaused
-      ? "▶️ Resume Execution"
-      : "⏸️ Pause Execution";
+export function registerEngineControls(controls: {
+  onStartup: () => Promise<void>;
+  onKill: () => Promise<void>;
+  onBankrollChange: (amount: number) => void;
+}) {
+  onStartupCallback = controls.onStartup;
+  onKillCallback = controls.onKill;
+  onBankrollChangeCallback = controls.onBankrollChange;
+}
 
-    return {
-      inline_keyboard: [
-        [
-          { text: "📊 Status", callback_data: "action_status" },
-          { text: "📈 View PnL", callback_data: "action_pnl" },
-        ],
-        [
-          { text: "💰 Set Bankroll", callback_data: "action_set_bankroll" },
-          { text: "🔄 Reset Stage 1", callback_data: "action_reset" },
-        ],
-        [{ text: pauseToggleText, callback_data: "action_toggle_pause" }],
-      ],
-    };
-  }
+export function waitForDoneCommand(): Promise<void> {
+  return new Promise((resolve) => {
+    doneResolver = resolve;
+  });
+}
 
-  /** Command and Callback Listener Declarations */
-  private registerHandlers(): void {
-    // 1. /start Command -> Renders Main Control Menu
-    this.bot.onText(/\/start/, (msg) => {
-      if (!this.isOwner(msg.from?.id)) return;
-      this.awaitingBankrollInput = false;
-
-      this.bot.sendMessage(msg.chat.id, this.getDashboardText(), {
-        parse_mode: "Markdown",
-        reply_markup: this.getMainMenuKeyboard(),
+// Helper: Edit existing dashboard or send a new one if missing
+async function updateDashboard(text: string, keyboard: InlineKeyboardMarkup) {
+  if (mainMessageId) {
+    try {
+      await bot.editMessageText(text, {
+        chat_id: CHAT_ID,
+        message_id: mainMessageId,
+        parse_mode: 'Markdown',
+        reply_markup: keyboard,
       });
-    });
-
-    // 2. Interactive Menu Callbacks
-    this.bot.on("callback_query", async (query) => {
-      if (!this.isOwner(query.from.id)) {
-        await this.bot.answerCallbackQuery(query.id, {
-          text: "🚫 Unauthorized user.",
-          show_alert: true,
-        });
-        return;
-      }
-
-      const chatId = query.message?.chat.id;
-      const messageId = query.message?.message_id;
-      if (!chatId || !messageId) return;
-
-      switch (query.data) {
-        // Fetch & Render Supabase PnL Metrics
-        case "action_pnl": {
-          this.awaitingBankrollInput = false;
-          await this.bot.answerCallbackQuery(query.id);
-
-          const stats = await this.db.getPnLStats();
-          const todayIcon = stats.todayPnL >= 0 ? "🟢" : "🔴";
-          const totalIcon = stats.totalPnL >= 0 ? "🟢" : "🔴";
-
-          const pnlText =
-            `📈 **Performance & PnL Report (Supabase)**\n\n` +
-            `📅 **Today's Stats:**\n` +
-            `• Net PnL: **${todayIcon} $${stats.todayPnL > 0 ? "+" : ""}${stats.todayPnL.toFixed(3)}**\n` +
-            `• Trades Placed: **${stats.todayTrades}** (Wins: ${stats.todayWins})\n\n` +
-            `🏆 **All-Time Summary:**\n` +
-            `• Total Net PnL: **${totalIcon} $${stats.totalPnL > 0 ? "+" : ""}${stats.totalPnL.toFixed(3)}**\n` +
-            `• Total Trades: **${stats.totalTrades}**\n` +
-            `• Win Rate: **${stats.winRate}%**`;
-
-          await this.bot.sendMessage(chatId, pnlText, {
-            parse_mode: "Markdown",
-            reply_markup: {
-              inline_keyboard: [[{ text: "« Back to Menu", callback_data: "action_menu" }]],
-            },
-          });
-          break;
-        }
-
-        // Display Active System State
-        case "action_status": {
-          this.awaitingBankrollInput = false;
-          await this.bot.answerCallbackQuery(query.id);
-
-          const statusText =
-            `📊 **Current Operating State**\n\n` +
-            `• Bankroll: **$${this.stakeManager.bankroll.toFixed(2)}**\n` +
-            `• Active Stage: **Stage ${this.stakeManager.getStageNumber()} / 8**\n` +
-            `• Next Stake: **$${this.stakeManager.getCurrentStake()}**\n` +
-            `• Status: **${this.isExecutionPaused ? "⏸️ PAUSED" : "🟢 ACTIVE"}**`;
-
-          await this.bot.sendMessage(chatId, statusText, {
-            parse_mode: "Markdown",
-            reply_markup: {
-              inline_keyboard: [[{ text: "« Back to Menu", callback_data: "action_menu" }]],
-            },
-          });
-          break;
-        }
-
-        // Prompt Bankroll Selection Options
-        case "action_set_bankroll": {
-          this.awaitingBankrollInput = true;
-          await this.bot.answerCallbackQuery(query.id);
-
-          const promptText =
-            `💰 **Set New Bankroll**\n\n` +
-            `Select a quick preset below or **reply directly with a custom number** (e.g. \`25.50\`):`;
-
-          await this.bot.sendMessage(chatId, promptText, {
-            parse_mode: "Markdown",
-            reply_markup: {
-              inline_keyboard: [
-                [
-                  { text: "$10", callback_data: "preset_10" },
-                  { text: "$20", callback_data: "preset_20" },
-                  { text: "$50", callback_data: "preset_50" },
-                  { text: "$100", callback_data: "preset_100" },
-                ],
-                [{ text: "« Cancel", callback_data: "action_menu" }],
-              ],
-            },
-          });
-          break;
-        }
-
-        // Reset Progression to Stage 1
-        case "action_reset": {
-          this.awaitingBankrollInput = false;
-          this.stakeManager.registerResult(true);
-          await this.bot.answerCallbackQuery(query.id, { text: "Reset to Stage 1" });
-
-          await this.bot.editMessageText(
-            `🔄 **Stage Reset Complete**\nReturned to **Stage 1** ($${this.stakeManager.getCurrentStake()}).`,
-            {
-              chat_id: chatId,
-              message_id: messageId,
-              parse_mode: "Markdown",
-              reply_markup: this.getMainMenuKeyboard(),
-            }
-          );
-          break;
-        }
-
-        // Toggle Pause/Resume State
-        case "action_toggle_pause": {
-          this.awaitingBankrollInput = false;
-          this.isExecutionPaused = !this.isExecutionPaused;
-          const statusMsg = this.isExecutionPaused
-            ? "Execution Paused ⏸️"
-            : "Execution Resumed 🟢";
-          await this.bot.answerCallbackQuery(query.id, { text: statusMsg });
-
-          await this.bot.editMessageText(this.getDashboardText(), {
-            chat_id: chatId,
-            message_id: messageId,
-            parse_mode: "Markdown",
-            reply_markup: this.getMainMenuKeyboard(),
-          });
-          break;
-        }
-
-        // Return to Main Menu
-        case "action_menu": {
-          this.awaitingBankrollInput = false;
-          await this.bot.answerCallbackQuery(query.id);
-          await this.bot.sendMessage(chatId, this.getDashboardText(), {
-            parse_mode: "Markdown",
-            reply_markup: this.getMainMenuKeyboard(),
-          });
-          break;
-        }
-
-        // Process Preset Button Allocations
-        case "preset_10":
-        case "preset_20":
-        case "preset_50":
-        case "preset_100": {
-          const val = parseFloat(query.data.replace("preset_", ""));
-          this.applyBankrollUpdate(chatId, val);
-          await this.bot.answerCallbackQuery(query.id, {
-            text: `Bankroll set to $${val}`,
-          });
-          break;
-        }
-      }
-    });
-
-    // 3. Catch Custom Text Inputs (Bankroll entry)
-    this.bot.on("message", (msg) => {
-      if (!this.isOwner(msg.from?.id)) return;
-      if (!this.awaitingBankrollInput || !msg.text || msg.text.startsWith("/")) return;
-
-      const amount = parseFloat(msg.text.trim());
-      if (isNaN(amount) || amount <= 0) {
-        this.bot.sendMessage(
-          msg.chat.id,
-          "❌ Invalid number. Enter a positive bankroll amount (e.g. `20`):",
-          { parse_mode: "Markdown" }
-        );
-        return;
-      }
-
-      this.applyBankrollUpdate(msg.chat.id, amount);
-    });
+      return;
+    } catch (err: any) {
+      // If message was deleted manually or failed to edit, fall back to sending new message
+    }
   }
 
-  /** Helper: Re-allocate Bankroll & Output Stage Breakdown */
-  private applyBankrollUpdate(chatId: number, amount: number): void {
-    this.awaitingBankrollInput = false;
-    const plan = this.stakeManager.updateBankroll(amount);
-    const breakdown = plan.stages
-      .map((s, i) => `• Stage ${i + 1}: **$${s.toFixed(3)}**`)
-      .join("\n");
+  const sent = await bot.sendMessage(CHAT_ID, text, {
+    parse_mode: 'Markdown',
+    reply_markup: keyboard,
+  });
+  mainMessageId = sent.message_id;
+}
 
-    const text =
-      `✅ **Bankroll Set to $${amount.toFixed(2)}**\n\n` +
-      `${breakdown}\n\n` +
-      `💼 *Allocated:* $${plan.allocated} | 🛡️ *Buffer:* $${plan.buffer}\n` +
-      `🔄 Active Stage 1 Stake: **$${this.stakeManager.getCurrentStake()}**`;
+// Main Menu View
+function getMainMenuMarkup(): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [
+        { text: isEngineOnline ? '🔴 Kill Session' : '🚀 Startup Session', callback_data: isEngineOnline ? 'action_kill' : 'action_startup' },
+      ],
+      [
+        { text: `💰 Bankroll: $${currentBankroll}`, callback_data: 'menu_bankroll' },
+        { text: '📊 Status', callback_data: 'action_status' },
+      ],
+    ],
+  };
+}
 
-    this.bot.sendMessage(chatId, text, {
-      parse_mode: "Markdown",
-      reply_markup: this.getMainMenuKeyboard(),
-    });
-  }
+function getMainMenuText(): string {
+  return (
+    `🤖 *BYTBOT Control Center*\n\n` +
+    `• *Status:* ${isEngineOnline ? '🟢 Online & Ready' : '🔴 Offline'}\n` +
+    `• *Active Bankroll:* $${currentBankroll.toFixed(2)}\n\n` +
+    `Select an option below:`
+  );
+}
 
-  /** Helper: Main Control Panel Text */
-  private getDashboardText(): string {
-    return (
-      `🤖 **BYTBOT Control Dashboard**\n\n` +
-      `• Bankroll: **$${this.stakeManager.bankroll.toFixed(2)}**\n` +
-      `• Active Stage: **Stage ${this.stakeManager.getStageNumber()} / 8**\n` +
-      `• Next Stake Input: **$${this.stakeManager.getCurrentStake()}**\n` +
-      `• Status: **${this.isExecutionPaused ? "⏸️ PAUSED" : "🟢 ACTIVE"}**\n\n` +
-      `Select an option below:`
+// Bankroll Menu View
+function getBankrollMenuMarkup(): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [
+        { text: '$10', callback_data: 'set_bankroll_10' },
+        { text: '$20', callback_data: 'set_bankroll_20' },
+        { text: '$50', callback_data: 'set_bankroll_50' },
+        { text: '$100', callback_data: 'set_bankroll_100' },
+      ],
+      [{ text: '« Back', callback_data: 'menu_main' }],
+    ],
+  };
+}
+
+// --- COMMAND HANDLERS ---
+
+// Command 1: /start
+bot.onText(/\/start/, async (msg) => {
+  waitingForBankrollInput = false;
+  // Delete user's /start text message to keep chat clean
+  await bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
+  await updateDashboard(getMainMenuText(), getMainMenuMarkup());
+});
+
+// Command 2: /done (Captcha Resolution)
+bot.onText(/\/done/, async (msg) => {
+  await bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
+  if (doneResolver) {
+    doneResolver();
+    doneResolver = null;
+    await updateDashboard(
+      `✅ *Captcha Solved!*\nResuming automation...`,
+      getMainMenuMarkup()
     );
   }
+});
 
-  public isPaused(): boolean {
-    return this.isExecutionPaused;
+// --- INLINE BUTTON CLICK HANDLERS ---
+
+bot.on('callback_query', async (query) => {
+  const data = query.data;
+  if (!data) return;
+
+  await bot.answerCallbackQuery(query.id);
+
+  if (data === 'menu_main') {
+    waitingForBankrollInput = false;
+    await updateDashboard(getMainMenuText(), getMainMenuMarkup());
+  } else if (data === 'menu_bankroll') {
+    waitingForBankrollInput = true;
+    await updateDashboard(
+      `💰 *Set Bankroll*\n\nSelect a quick preset below or reply directly to this chat with a custom number (e.g., \`15\` or \`25.50\`):`,
+      getBankrollMenuMarkup()
+    );
+  } else if (data.startsWith('set_bankroll_')) {
+    const amount = parseFloat(data.replace('set_bankroll_', ''));
+    currentBankroll = amount;
+    if (onBankrollChangeCallback) onBankrollChangeCallback(amount);
+    waitingForBankrollInput = false;
+
+    await updateDashboard(
+      `✅ *Bankroll updated to $${amount.toFixed(2)}*\n\n` + getMainMenuText(),
+      getMainMenuMarkup()
+    );
+  } else if (data === 'action_startup') {
+    await updateDashboard(
+      `⏳ *Booting Engine...*\nConnecting browser session & loading cookies...`,
+      { inline_keyboard: [] }
+    );
+    try {
+      if (onStartupCallback) await onStartupCallback();
+      isEngineOnline = true;
+      await updateDashboard(
+        `✅ *Engine Session Ready!*\n\n` + getMainMenuText(),
+        getMainMenuMarkup()
+      );
+    } catch (err: any) {
+      isEngineOnline = false;
+      await updateDashboard(
+        `❌ *Startup Failed:* ${err.message}`,
+        getMainMenuMarkup()
+      );
+    }
+  } else if (data === 'action_kill') {
+    await updateDashboard(`⏳ *Closing browser session...*`, {
+      inline_keyboard: [],
+    });
+    try {
+      if (onKillCallback) await onKillCallback();
+      isEngineOnline = false;
+      await updateDashboard(
+        `🔴 *Engine Offline.*\n\n` + getMainMenuText(),
+        getMainMenuMarkup()
+      );
+    } catch (err: any) {
+      await updateDashboard(
+        `⚠️ *Kill Error:* ${err.message}`,
+        getMainMenuMarkup()
+      );
+    }
+  } else if (data === 'action_status') {
+    await updateDashboard(
+      `📊 *System Status*\n\n` +
+        `• Engine: ${isEngineOnline ? '🟢 RUNNING' : '🔴 OFF'}\n` +
+        `• Bankroll: $${currentBankroll.toFixed(2)}\n`,
+      {
+        inline_keyboard: [[{ text: '« Back', callback_data: 'menu_main' }]],
+      }
+    );
   }
+});
 
-  public async notifyTradeSuccess(
-    periodId: string,
-    option: string,
-    stage: number,
-    amount: number
-  ): Promise<void> {
-    const text =
-      `🚀 **Trade Order Executed**\n\n` +
-      `• Period ID: **#${periodId}**\n` +
-      `• Option: **${option}**\n` +
-      `• Execution Level: **Stage ${stage}**\n` +
-      `• Stake Amount: **$${amount.toFixed(3)}**`;
+// --- TEXT INPUT LISTENER (Custom Bankroll Replies) ---
 
-    await this.bot.sendMessage(this.allowedUserId, text, { parse_mode: "Markdown" });
+bot.on('message', async (msg) => {
+  if (msg.text?.startsWith('/')) return; // Ignore slash commands
+
+  // Auto-delete the message the user typed to keep chat clean
+  await bot.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
+
+  if (waitingForBankrollInput && msg.text) {
+    const parsed = parseFloat(msg.text.replace('$', '').trim());
+    if (!isNaN(parsed) && parsed > 0) {
+      currentBankroll = parsed;
+      if (onBankrollChangeCallback) onBankrollChangeCallback(parsed);
+      waitingForBankrollInput = false;
+
+      await updateDashboard(
+        `✅ *Bankroll updated to $${parsed.toFixed(2)}*\n\n` + getMainMenuText(),
+        getMainMenuMarkup()
+      );
+    }
   }
+});
 
-  public async notifyResultLog(
-    periodId: string | undefined,
-    isWin: boolean,
-    newStage: number,
-    nextStake: number
-  ): Promise<void> {
-    const statusIcon = isWin ? "🟢 WIN" : "🔴 LOSS";
-    const periodText = periodId ? ` (#${periodId})` : "";
-
-    const text =
-      `📊 **Round Outcome Logged${periodText}**\n\n` +
-      `• Result: **${statusIcon}**\n` +
-      `• Next Stage: **Stage ${newStage} / 8**\n` +
-      `• Next Stake Input: **$${nextStake.toFixed(3)}**`;
-
-    await this.bot.sendMessage(this.allowedUserId, text, { parse_mode: "Markdown" });
-  }
-
-  public async notifyError(message: string): Promise<void> {
-    const text = `⚠️ **System Warning / Execution Failed**\n\n\`${message}\``;
-    await this.bot.sendMessage(this.allowedUserId, text, { parse_mode: "Markdown" });
-  }
+// Helper for trade executor to send Captcha Link inside the dashboard
+export async function sendCaptchaPrompt(url: string) {
+  await updateDashboard(
+    `⚠️ *Cloudflare Verification Required*\n\n` +
+      `Click below to view the browser screen and solve the captcha:\n\n` +
+      `🔗 [Open Live Session](${url})\n\n` +
+      `Once solved, send \`/done\` to resume.`,
+    {
+      inline_keyboard: [
+        [{ text: '🌐 Open Browser Canvas', url }],
+      ],
+    }
+  );
 }
