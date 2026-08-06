@@ -1,7 +1,7 @@
 {
   "name": "bytrading-auto-bot",
   "version": "1.0.0",
-  "description": "Automated 8-stage Telegram signal listener and trade execution engine",
+  "description": "Automated 8-stage Telegram signal listener, Supabase logging engine, and Puppeteer trade executor",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
@@ -9,6 +9,7 @@
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.43.4",
     "dotenv": "^16.4.5",
     "node-telegram-bot-api": "^0.66.0",
     "puppeteer": "^22.10.0",
