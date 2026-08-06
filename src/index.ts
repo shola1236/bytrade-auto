@@ -185,7 +185,7 @@ async function bootstrap() {
 
       // Push result report to Telegram
       await bot.notifyResultLog(
-        result.periodId || settledTrade?.periodId,
+        result.periodId || settledTrade?.periodId || "",
         result.isWin,
         outcome.newStage,
         outcome.nextStake
