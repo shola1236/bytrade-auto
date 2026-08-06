@@ -1,17 +1,19 @@
 {
   "name": "bytrading-auto-bot",
   "version": "1.0.0",
-  "description": "Automated 8-stage signal listener and execution engine",
+  "description": "Automated 8-stage Telegram signal listener and trade execution engine",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node-dev --respawn src/index.ts"
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
     "node-telegram-bot-api": "^0.66.0",
     "puppeteer": "^22.10.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "telegram": "^2.22.2"
   },
   "devDependencies": {
