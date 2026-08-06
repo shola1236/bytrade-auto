@@ -58,6 +58,16 @@ export class StakeManager {
     this.recalculatePlan();
   }
 
+  /** Get active bankroll amount */
+  public getBankroll(): number {
+    return this.bankroll;
+  }
+
+  /** Set bankroll amount and reset stage index */
+  public setBankroll(newBankroll: number): StakePlan {
+    return this.updateBankroll(newBankroll);
+  }
+
   /** Recalculate plan based on current bankroll */
   public recalculatePlan(): StakePlan {
     const plan = calculateDynamicStakes(this.bankroll);
