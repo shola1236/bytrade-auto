@@ -16,7 +16,7 @@
     "puppeteer-core": "^22.15.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "steel-sdk": "^0.1.2",
+    "steel-sdk": "^0.18.0",
     "telegram": "^2.22.2"
   },
   "devDependencies": {
